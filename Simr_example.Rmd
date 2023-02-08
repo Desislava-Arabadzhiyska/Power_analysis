@@ -1,0 +1,152 @@
+---
+title: "Simr_example"
+output: html_document
+date: '2022-10-13'
+---
+
+
+Packages you will need
+```{r setup, message=FALSE}
+library("dplyr")
+library("tidyverse")
+library("lme4")
+library("simr")
+library("effects")
+```
+
+Here we will work through an example from the DevSci experiment and we will use the MainTaskAll.csv file, which contains single trail information from the task. Because we will need a 'cohort' variable, we will also include the demographic information file
+
+```{r}
+#read in demographic file
+dem <- read.csv("Demographics.csv")%>%
+  filter(category== '10-12' | category == '16-18')%>% #Here we're interested in the 2 extreme categories
+  select(ID, category)#makes the table more manageable
+
+#Read in data file 
+dat_full <- read.csv("MainTaskAll.csv")%>%
+  filter(Type == 'MP')%>%#for this exercise we don't need the MM sentences
+  select(-Type) %>%#thus rendering this column irrelevant
+  filter(!is.na(Correct.x))%>% #remove NAs
+  filter(Correct.x != 2)%>% #remove invalid values
+  filter(List == 2)%>% #non-words don't appear as MPs across Lists, so we will constrain ourselvels to the larger list
+  inner_join(dem, by = 'ID')%>% #when we inner_join here we are only left with responses of people in our selected age range
+ mutate(category_dummy = ifelse(category == '10-12', 0, 1))#dummy coding the cohorts
+
+#for visualization purposes, we're declaring some variables as factors
+dat_full$Correct.y <- factor(dat_full$Correct.y)
+dat_full$Correct.x <- factor(dat_full$Correct.x)
+dat_full$category_dummy <- factor(dat_full$category_dummy)
+```
+
+Here we will quickly visualize our data to get a better understanding of what we're working with
+```{r}
+CorVSIncor <- dat_full%>% 
+  group_by(Correct.x, ID)%>% #we want the data grouped by whether the response was correct or not and we want aggregates the information for each participant
+  summarise(mn = mean(Enjoyment))#and we want the means
+
+CorVSIncor %>%
+  ggplot(aes(Correct.x, mn, color = Correct.x)) + geom_point(size = 3) + geom_violin(alpha = 0.5) + stat_summary(fun=mean, colour="black", size = 5, alpha = 0.5, geom="point")+ stat_summary(fun=mean, colour="black", size = 2, alpha = 0.5, geom="line", group = 0) + ggtitle('Overall trends') + xlab('Accuracy') + ylab('Enjoyment')
+
+CorVSIncor_cohort <- dat_full%>% 
+  group_by(Correct.x, ID, category_dummy)%>%#here we also want to group by cohort
+  summarise(mn = mean(Enjoyment))
+
+CorVSIncor_cohort %>%
+  ggplot(aes(Correct.x, mn, color = Correct.x)) + geom_point(size = 3) + geom_violin(alpha = 0.5) + facet_wrap(~category_dummy, labeller= as_labeller(c(`0` ='Younger', `1` ='Older'))) + stat_summary(fun=mean, colour="black", size = 5, alpha = 0.5, geom="point")+ stat_summary(fun=mean, colour="black", size = 2, alpha = 0.5, geom="line", group = 0) + ggtitle('By cohort trends') + xlab('Accuracy') + ylab('Enjoyment')
+#ggsave('Simr_output/Cor_Enj_T1_1List_cat.png')
+```
+
+Some additional adjustments to the variables - centering (to deviation code them, to make sure the effects are true main effects)
+```{r}
+## Set Participants and Items as factors
+dat_full$Word <- as.factor(dat_full$Word)
+dat_full$ID <- as.factor(dat_full$ID)
+
+#turn enjoyment and payment responses as numeric values
+dat_full$Enjoyment<-as.numeric(dat_full$Enjoyment)
+
+#Center enjoyment
+dat_full <- dat_full %>%
+  mutate(Enjoyment_centered = Enjoyment - mean(Enjoyment,na.rm=TRUE))
+dat_full <- dat_full %>%
+  mutate(Corr_centered = as.numeric(Correct.x) - mean(as.numeric(Correct.x),na.rm=TRUE))
+dat_full <- dat_full %>%
+  mutate(cat_centered = as.numeric(category_dummy) - mean(as.numeric(category_dummy),na.rm=TRUE))
+```
+
+Here we're examining the enjoyment simply as a function of accuracy
+```{r}
+#setting up the model. here we have a linear model so no need for glmer. We're adding by subject and by item random intercepts
+enj <- lmer(Enjoyment_centered ~ Corr_centered + (1|ID) + (1|Word), data = dat_full,control = lmerControl(optimizer = "bobyqa")) 
+summary(enj) #look at results
+#save(enj, file = "Simr_output/enj_1List.RData")#Minght want to save output
+
+#If you wish to save the effects plot
+#png('Simr_output/Correctness_effect_T1_1List.png')
+#plot(effect("Corr_centered", enj))
+#dev.off()
+
+#estimating the currently observed power for the Corr_centered main effect
+Enj_Power <- powerSim(enj, test = fixed("Corr_centered", method = "lr"), nsim = 1000, alpha = 0.05)
+Enj_Power #view power
+#save(Enj_Power, file = "Simr_output/enj_power_T1_1List.RData")#If you want to save power output
+
+#Extend data
+Enj_500ppts <- extend(enj, along = "ID", n = 500) #You can use along if you don't have a grouping variable. If you have groups you will need to specify the grouping variable, this will create n number of entries within each group, so if you have 2 groups and you specify n = 100, you will have 200 entries. You can check all of this using getData(Enj_500ppts). It's good if the number is a multiple of items number
+Enj_500ppts_36ptps <- extend(Enj_500ppts, along = "Word", n = 36) #and additionally along the item dimension (note, this can be done on its own)
+
+# Create a power curve for the effect of Corr_centered showing number of participants against power
+Correctness_PowerCurve <- powerCurve(Enj_500ppts_36ptps, test = fixed("Corr_centered", method = "lr"), nsim = 1000, alpha = 0.05,
+                                   along = "ID", breaks = seq(20, 300, by = 20))
+print(Correctness_PowerCurve)#view output
+#save(Correctness_PowerCurve, file = "Simr_output/Cor_PowerCurve_T1_1List.RData")#Strongly recommend saving this output - it can take a very long time to compute and you don't want to have to redo it. To load the data in afterwards: load("yourdirectory/file.RData")
+
+#if you want to save the plot
+#png('Simr_output/Cor_powerplot_T1_1List.png')
+#plot(Correctness_PowerCurve, xlab = "number of participants")# Plot the power curve for the effect of Corr_centered showing number of participants against power
+#dev.off()
+```
+
+Examining interaction effects Version 1:
+defining the interaction effect directly under 'fixed' i.e. Test a single fixed effect, specified by xname. This works in the same way as the example above
+```{r}
+enj_withcat <- lmer(Enjoyment_centered ~ Corr_centered*cat_centered + (1|ID) + (1|Word), data = dat_full,control = lmerControl(optimizer = "bobyqa")) 
+summary(enj_withcat) 
+#save(enj_withcat, file = "Simr_output/enj_withcat_1List.RData")
+
+#png('Simr_output/CorxCat_inter_T1_1List.png')
+#plot(effect("Corr_centered:cat_centered", enj_withcat))
+#dev.off()
+
+Enj_withcat_300ppts <- extend(enj_withcat, along = "ID", n = 300)
+Enj_withcat_300ppts_36words <- extend(Enj_withcat_300ppts, along = "Word", n = 36)
+
+Correctness_PowerCurve_withcat <- powerCurve(Enj_withcat_300ppts_36words, test = fixed("Corr_centered:cat_centered", method = "lr"), nsim = 1000, alpha = 0.05,
+                                     along = "ID", breaks = seq(20, 150, by = 10)) #here we're specifying the Corr_centered:cat_centered as the effect of interest
+print(Correctness_PowerCurve_withcat)
+#save(Correctness_PowerCurve_withcat, file = "Simr_output/Correctness_PowerCurve_withcat_1List.RData")#Once again, I encourage saving this
+```
+
+Version2: Examining the interaction effect with the 'compare' option i.e. Compare the current model to a smaller one specified by the formula model.
+
+```{r}
+#here we need to start with the full model
+enj_withcat <- lmer(Enjoyment_centered ~ Corr_centered*cat_centered + (1|ID) + (1|Word), data = dat_full,control = lmerControl(optimizer = "bobyqa")) 
+
+#then define the smaller model without the interaction
+enj_withcat_no_inter <- lmer(Enjoyment_centered ~ Corr_centered*cat_centered - Corr_centered:cat_centered + (1|ID) + (1|Word), data = dat_full,control = lmerControl(optimizer = "bobyqa")) 
+summary(enj_withcat_no_inter) 
+
+#here we would need to extend both models
+Enj_withcat_300ppts <- extend(enj_withcat, along = "ID", n = 300)
+Enj_withcat_300ppts_36words <- extend(Enj_withcat_300ppts, along = "Word", n = 36)
+enj_withcat_no_inter_300ppts <- extend(enj_withcat_no_inter, along = "ID", n = 300)
+enj_withcat_no_inter_300ppts_36words <- extend(enj_withcat_no_inter_300ppts, along = "Word", n = 36)
+
+#here when we're calculating our power culrve, we need to specify the fcompare test and include the smaller model
+Enj_Power_withcat_comapre_no_inter <- powerCurve(Enj_withcat_300ppts_36words, test = fcompare(enj_withcat_no_inter_300ppts_36words, method = "lr"), nsim = 1000, alpha = 0.05,
+                                             along = "ID", breaks = seq(20, 300, by = 10))
+print(Enj_Power_withcat_comapre_no_inter)
+#save(Enj_Power_withcat_comapre_no_inter, file = "Simr_output/Enj_Power_withcat_comapre_no_inter_1List.RData")#Once again, I encourage saving this
+```
+
