@@ -1,0 +1,158 @@
+---
+title: "GelmanHillexample"
+output: html_notebook
+---
+based on the script: https://debruine.github.io/lmem_sim/articles/appendix1a_example_code.html
+and on Gelman & Hill, 2006
+
+```{r}
+# load required packages
+library("lme4")        # model specification / estimation
+library('lmerTest')
+library("broom.mixed") # extracting data from model fits 
+library("tidyverse")   # data wrangling and visualisation
+
+```
+
+
+```{r}
+#Data used to generate original model, which we will use later to simulate our data
+dat_full <- read.csv("MainTaskAll.csv")%>%
+  filter(Type == 'MP')%>%#for this exercise we don't need the MM sentences
+  select(-Type) %>%#thus rendering this column irrelevant
+  filter(!is.na(Correct.x))%>% #remove NAs
+  filter(Correct.x != 2)%>% #remove invalid values
+  filter(List == 2)%>% #non-words don't appear as MPs across Lists, so we will constrain ourselves to the larger list
+  mutate(Corr_centered = as.numeric(Correct.x) - mean(as.numeric(Correct.x),na.rm=TRUE))#makes sure that the intercept is the grand mean - i.e. makes it easier to then manipulate everything else
+
+enj <- lmer(Enjoyment ~ Corr_centered + (1|ID) + (1|Word), data = dat_full,control = lmerControl(optimizer = "bobyqa")) 
+summary(enj)
+ests <- broom.mixed::tidy(enj)
+
+fit_par <- getME(enj, c("theta","sigma")) 
+fit_par$beta <- fixef(enj)
+fit_par
+
+fit_par2 <- fit_par
+fit_par2$beta[1] <- fit_par2$beta[1] - 1
+```
+
+```{r}
+#Define number of items and subjects
+n_i <- 36
+n_s  <- 50
+#extract observed mean and standard deviation
+mean_accuracy <- mean(dat_full$Correct.x)
+sd_accuracy <- dat_full%>%group_by(ID)%>%summarise(m = mean(Correct.x))%>% summarise(s = sd(m))%>%pluck('s', 1)
+
+```
+
+
+```{r}
+#create a simulation function
+simulate_data <- function(N, fit_par, m_accuracy, s_accuracy, n2){
+  
+  #Create responses
+ac <- 0 # to check whether the generated data has the same mean as our original data
+s <- 0 # to check whether the generated data has the same sd as our original data
+while (ac < (m_accuracy - 0.05) | ac > (m_accuracy + 0.05) | s <= (s_accuracy - 0.1) | s >  (s_accuracy + 0.1)){ 
+  accs <- c() # to store the simulated accuracy data
+  for (i in 1:N){ # we will create example response patterns for each participant
+    t <-0 # in case there are any constraints, we need to define a value to check against
+    while (t <= 0.3 | t > 1) {#smaller accuracies will be discarded in reality and values above 1 are impossible
+      t <- rnorm(1, m_accuracy, s_accuracy) # get the accuracy value from a normal distribution with the same characteristics as our original dataset
+    }
+    accs[i] <- t # record the valid accuracy 
+  }
+  ac <- mean(accs) # when we get a dataset across participants, make sure that the overall accuracy and sd corresponds to the original dataset's
+  s <- sd(accs)
+}
+
+correct_resps <- c() # we will store the simulated responses here
+
+for (i in 1:N){ # for each participant 
+  
+  temp <- rep(0, n2) # get a storage space
+  temp[1:round(accs[i]*n2)] <- 1 # place a number of correct responses that corresponds to that participant's accuracy
+  correct_resps[(((i-1)*n2)+1):(i*n2)]<- sample(temp, length(temp)) #shuffle those values around and store them
+  
+}
+
+
+
+sim_d <- expand.grid(ID = factor(1:N),
+                     Word = words[1:n2])%>%
+  mutate(cor= correct_resps)%>%
+   mutate(Corr_centered = as.numeric(cor) - mean(as.numeric(cor),na.rm=TRUE))
+
+sim_d$score <- simulate(~ Corr_centered + (1|ID) + (1|Word),
+                        nsim=1,
+                        family=gaussian,
+                        newdata = sim_d,
+                        newparams=fit_par
+                          ,
+                        use.u = FALSE)$sim_1
+ return(sim_d)
+}
+```
+
+```{r}
+#define a function that uses simulated data for typically developing kids and those with reading disorders and combines the data in 1 table
+get_combined_cohorts <- function(fit_par, fit_par2, N, N2, m_accuracy, s_accuracy) {
+o <- simulate_data(N, fit_par, m_accuracy, s_accuracy, N2)%>%
+  mutate(coh = 1)
+
+nw <- simulate_data(N, fit_par2, m_accuracy, s_accuracy, N2)%>%
+  mutate(coh = 0)%>%mutate(ID = as.factor(as.integer(ID)+10000))
+
+comb <- bind_rows(o, nw)%>%
+  select(-Corr_centered)%>%
+  mutate(Corr_cent = as.numeric(cor) - mean(as.numeric(cor),na.rm=TRUE), 
+         coh_cent = as.numeric(coh) - mean(as.numeric(coh),na.rm=TRUE))
+return(comb)
+}
+
+```
+
+
+
+```{r}
+#run a model on the simulated data and test for significance
+test_significance <- function(sim_d){
+  mod <- lmer(score ~ coh_cent+Corr_cent + (1|ID) + (1|Word), sim_d)
+  p_value <- summary(mod)$coefficients["coh_cent","Pr(>|t|)"]
+  return(p_value)
+}
+
+```
+
+```{r}
+#define simulations number
+N_sim <- 500
+#define subjects
+N_workers <- seq(20, 40, by = 1)
+sim_res <- data.frame() # empty object for storing results
+for(w in N_workers){
+  for(i in 1:N_sim){
+    p_val <- test_significance(get_combined_cohorts(fit_par, fit_par2, w, 36, mean_accuracy, sd_accuracy))
+    sim_res <- rbind(sim_res, data.frame(N=w, p=p_val))
+    print(paste0('N = ', as.character(w), ' sim = ', as.character(i)))
+  }
+}
+#recode for power analysis
+sim_res$significant <- ifelse(sim_res$p<0.05 ,1 ,0)
+```
+
+```{r}
+#plot a power plot
+sim_res %>%
+  group_by(N) %>%
+  summarise(SE = sqrt((mean(significant) * (1 - mean(significant)))/length(significant)),
+            significant = mean(significant)) %>%
+  ggplot(aes(x=N, y=significant))+
+  geom_line(color="blue")+
+  geom_errorbar(aes(ymin=significant-SE, ymax=significant+SE),width=0,color="blue")+
+  geom_point(color="blue",size=2)+
+  geom_hline(yintercept = 0.8,lty=2)+
+  labs(y="power")+ ylim(0, 1)
+```
